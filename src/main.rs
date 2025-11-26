@@ -7,6 +7,7 @@ use std::io::{self, BufRead, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -538,8 +539,16 @@ fn initialize_response(id: Value) -> Value {
 
 fn main() {
     let config = Config::from_env();
+    let env_filter = EnvFilter::try_new(config.log_level.as_str()).unwrap_or_else(|err| {
+        eprintln!(
+            "Invalid SERIAL_MCP_LOG_LEVEL '{}': {err}; falling back to 'info'",
+            config.log_level
+        );
+        EnvFilter::new("info")
+    });
+
     tracing_subscriber::fmt()
-        .with_env_filter(config.log_level.as_str())
+        .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
         .init();
 
