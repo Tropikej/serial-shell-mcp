@@ -1,0 +1,20 @@
+model = "gpt-5.1-codex-max"
+[notice]
+"hide_gpt-5.1-codex-max_migration_prompt" = true
+
+
+[features]
+rmcp_client = true  # recommended for MCP STDIO support
+
+[mcp_servers.embedded_debugger]
+command = "E:\\MCP\\embedded-debugger-mcp\\target\\release\\embedded-debugger-mcp.exe"
+args = []  # or ["--config", "C:\\path\\to\\your\\embedded-debugger-config.toml"] if you use its own config
+
+[mcp_servers.embedded_debugger.env]
+RUST_LOG = "info"
+
+[[mcp.servers]]
+id = "serial-mcp"
+command = "E:\\Projets\\serial-shell-mcp\\target\\release\\serial-shell-mcp.exe"
+args = []
+auto_start = true
