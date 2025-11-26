@@ -519,12 +519,18 @@ fn initialize_response(id: Value) -> Value {
     render_ok_response(
         id,
         json!({
+            "protocolVersion": "2024-11-05",
             "serverInfo": {
                 "name": "serial-mcp",
                 "version": env!("CARGO_PKG_VERSION"),
             },
             "capabilities": {
-                "tools": tool_list_schema().tools,
+                "tools": {
+                    // Advertise that the server supports listing and calling tools
+                    // via the standard MCP tool APIs. The actual tool schemas are
+                    // returned by the list_tools/tools/list method.
+                    "listChanged": false,
+                },
             }
         }),
     )
