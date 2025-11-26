@@ -315,9 +315,11 @@ fn connect(
     params: ConnectParams,
     config: &Config,
 ) -> Result<ConnectResult, ServerError> {
-    let port_name = params.port.to_uppercase();
+    let port_name = params.port;
+    let normalized_port = port_name.to_uppercase();
+
     if let Some(allowed) = &config.allowed_ports {
-        if !allowed.contains(&port_name) {
+        if !allowed.contains(&normalized_port) {
             return Err(ServerError::PortDenied);
         }
     }
