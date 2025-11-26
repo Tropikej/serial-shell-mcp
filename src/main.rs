@@ -1,9 +1,9 @@
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{error::Category, json, Value};
 use serialport::{available_ports, DataBits, Parity, SerialPort, SerialPortType, StopBits};
 use std::collections::{HashMap, HashSet};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -57,6 +57,7 @@ impl Config {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ToolDescription {
     name: String,
     description: String,
@@ -64,6 +65,7 @@ struct ToolDescription {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ToolListResult {
     tools: Vec<ToolDescription>,
 }
@@ -75,6 +77,7 @@ struct CallToolParams {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CallToolResult {
     content: Vec<Content>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -311,6 +314,184 @@ fn text_content(text: impl Into<String>) -> Content {
     }
 }
 
+#[cfg(windows)]
+fn configure_stdio_binary() {
+    const O_BINARY: i32 = 0x8000;
+    const STDIN_FILENO: i32 = 0;
+    const STDOUT_FILENO: i32 = 1;
+
+    unsafe {
+        extern "C" {
+            fn _setmode(fd: i32, mode: i32) -> i32;
+        }
+
+        if _setmode(STDIN_FILENO, O_BINARY) == -1 {
+            eprintln!("Failed to set stdin binary mode");
+        }
+        if _setmode(STDOUT_FILENO, O_BINARY) == -1 {
+            eprintln!("Failed to set stdout binary mode");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn configure_stdio_binary() {}
+
+#[derive(Clone, Copy, Debug)]
+enum FrameStyle {
+    Http,
+    Raw,
+}
+
+fn read_message(reader: &mut impl BufRead) -> io::Result<Option<(String, FrameStyle)>> {
+    loop {
+        let Some(first_byte) = peek_first_non_whitespace(reader)? else {
+            return Ok(None);
+        };
+
+        if first_byte == b'{' || first_byte == b'[' {
+            return read_unframed_json(reader).map(|msg| Some((msg, FrameStyle::Raw)));
+        }
+
+        let mut line = String::new();
+        let mut content_length: Option<usize> = None;
+
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line)?;
+            if read == 0 {
+                return if content_length.is_some() {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "stream closed mid-frame",
+                    ))
+                } else {
+                    Ok(None)
+                };
+            }
+
+            let trimmed = line.trim();
+
+            if trimmed.is_empty() {
+                if let Some(len) = content_length {
+                    let mut buf = vec![0u8; len];
+                    reader.read_exact(&mut buf)?;
+                    let message = String::from_utf8(buf)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    return Ok(Some((message, FrameStyle::Http)));
+                }
+
+                continue;
+            }
+
+            if let Some(first_char) = trimmed.chars().next() {
+                if first_char == '{' || first_char == '[' {
+                    return Ok(Some((trimmed.to_string(), FrameStyle::Raw)));
+                }
+            }
+
+            if let Some((name, value)) = trimmed.split_once(':') {
+                let name = name.trim();
+                let value = value.trim();
+
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = Some(
+                        value
+                            .parse()
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                    );
+                }
+
+                continue;
+            }
+
+            return Ok(Some((trimmed.to_string(), FrameStyle::Raw)));
+        }
+    }
+}
+
+fn peek_first_non_whitespace(reader: &mut impl BufRead) -> io::Result<Option<u8>> {
+    let mut bom_checked = false;
+
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+
+        if !bom_checked && buffer.len() >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF {
+            reader.consume(3);
+            bom_checked = true;
+            continue;
+        }
+        bom_checked = true;
+
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let byte = buffer[offset];
+            if byte.is_ascii_whitespace() {
+                offset += 1;
+                continue;
+            }
+
+            if offset > 0 {
+                reader.consume(offset);
+            }
+            return Ok(Some(byte));
+        }
+
+        reader.consume(offset);
+    }
+}
+
+fn read_unframed_json(reader: &mut impl BufRead) -> io::Result<String> {
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+
+    loop {
+        match serde_json::from_slice::<Value>(&buffer) {
+            Ok(value) => {
+                return serde_json::to_string(&value)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+            }
+            Err(err) => {
+                if err.classify() != Category::Eof {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, err));
+                }
+            }
+        }
+
+        reader.read_exact(&mut byte)?;
+        buffer.push(byte[0]);
+    }
+}
+
+fn write_json_response_with_frame(
+    stdout: &mut impl Write,
+    response: &Value,
+    frame: FrameStyle,
+) -> io::Result<()> {
+    let payload = serde_json::to_string(response)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    match frame {
+        FrameStyle::Http => {
+            let header = format!(
+                "Content-Length: {}\r\nContent-Type: application/json\r\n\r\n",
+                payload.as_bytes().len()
+            );
+            stdout.write_all(header.as_bytes())?;
+            stdout.write_all(payload.as_bytes())?;
+        }
+        FrameStyle::Raw => {
+            stdout.write_all(payload.as_bytes())?;
+            stdout.write_all(b"\n")?;
+        }
+    }
+
+    stdout.flush()
+}
+
 fn connect(
     manager: &SessionManager,
     params: ConnectParams,
@@ -538,6 +719,7 @@ fn initialize_response(id: Value) -> Value {
 }
 
 fn main() {
+    configure_stdio_binary();
     let config = Config::from_env();
     let env_filter = EnvFilter::try_new(config.log_level.as_str()).unwrap_or_else(|err| {
         eprintln!(
@@ -556,18 +738,25 @@ fn main() {
     let manager = SessionManager::new();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-    let reader = stdin.lock();
+    let mut reader = BufReader::new(stdin.lock());
 
     let tool_schemas = tool_list_schema();
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
+    loop {
+        let message = match read_message(&mut reader) {
+            Ok(Some(m)) => m,
+            Ok(None) => break,
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                error!("Invalid JSON: {err}");
+                continue;
+            }
             Err(err) => {
                 error!("Failed to read stdin: {err}");
                 break;
             }
         };
+
+        let (line, frame) = message;
 
         if line.trim().is_empty() {
             continue;
@@ -580,6 +769,15 @@ fn main() {
                 continue;
             }
         };
+
+        if request.get("id").is_none() {
+            if let Some(method) = request.get("method").and_then(|v| v.as_str()) {
+                info!("Received notification '{method}', ignoring");
+            } else {
+                warn!("Received notification without method");
+            }
+            continue;
+        }
 
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let method = match request.get("method").and_then(|v| v.as_str()) {
@@ -616,13 +814,8 @@ fn main() {
             _ => render_error_response(id, &ServerError::InvalidArgument("Unknown method".into())),
         };
 
-        if let Err(err) = writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()) {
+        if let Err(err) = write_json_response_with_frame(&mut stdout, &response, frame) {
             error!("Failed to write response: {err}");
-            break;
-        }
-
-        if let Err(err) = stdout.flush() {
-            error!("Failed to flush response: {err}");
             break;
         }
     }
